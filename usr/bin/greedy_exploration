@@ -1,0 +1,293 @@
+#!/usr/bin/env python
+
+
+"""
+A greedy explorer, mostly the same as random, but picks 10 points and random
+and moves to the one with the most unknown space around it.
+"""
+"""
+got help from
+https://github.com/cwru-robotics/cwru-ros-pkg/blob/master/cwru_semi_stable/cwru_goal_planner/src/simple_goal_reader.py
+and 
+http://pi-robot-ros-pkg.googlecode.com/svn/trunk/experimental/pi_robot/pi_navigation/nodes/nav_test.py
+
+"""
+"""
+Copyright (c) 2012, Karl F. Fezer
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met: 
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer. 
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution. 
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The views and conclusions contained in the software and documentation are those
+of the authors and should not be interpreted as representing official policies, 
+either expressed or implied, of the FreeBSD Project.
+
+"""
+
+import roslib; roslib.load_manifest('aticuss')
+import rospy, sound_play, os, sys, collections, random, actionlib, tf
+from tf import TransformListener
+from std_msgs.msg import Float64
+from geometry_msgs.msg import PoseStamped
+from move_base_msgs.msg import MoveBaseAction
+from move_base_msgs.msg import MoveBaseGoal
+from actionlib_msgs.msg import GoalStatus
+from geometry_msgs.msg import Quaternion
+from nav_msgs.srv import GetMap
+from visualization_msgs.msg import Marker
+from visualization_msgs.msg import MarkerArray
+from geometry_msgs.msg import PoseWithCovarianceStamped as Pose
+import math
+from aticuss.msg import GA
+from geometry_msgs.msg import Twist
+from common_methods import *
+
+
+"""
+def create_Point(x, y):
+    marker = Marker()
+    marker.id = random.uniform(0, 100)
+    marker.header.frame_id = "/map"
+    marker.type = marker.SPHERE
+    marker.action = marker.ADD
+    marker.scale.x = 0.2
+    marker.scale.y = 0.2
+    marker.scale.z = 0.2
+    marker.pose.orientation.w = 1.0
+    #Makes the Point Purple?
+    marker.color.a = 1.0
+    marker.color.b = .5
+    marker.color.r = 1.0
+    marker.pose.position.x = x
+    marker.pose.position.y = y
+    marker.pose.position.z = 0
+    return marker
+"""
+
+def new_Goal(x,y, type):
+    map = get_map()
+    #type == rand or rec
+    goal = MoveBaseGoal()
+    #frame of reference
+    goal.target_pose.header.frame_id = 'map'
+    goal.target_pose.header.stamp = rospy.Time.now()
+    #location
+    #recursive op, chooses random location between goal and 75% of way to origin
+    if(type == "rec"):
+        robot_x, robot_y = current_loc
+        goal.target_pose.pose.position.x = random.uniform( robot_x, x * .75)
+        goal.target_pose.pose.position.y = random.uniform( robot_y, y * .75)
+    else: #type == "rand"
+            #find a known location on map, can't moved to unkown areas
+    #the only change from random_exploration
+        possible_points = []
+        print "Finding possible Goals"
+        while len(possible_points) < 10:
+            
+            a_point = random.randint(1, len(map.map.data) - 1)
+            #100 is occupied, -1 is unknown
+            if (100 > map.map.data[a_point] >= 0):
+                    #map data is in row-major order, get position
+                    possible_points.append( a_point)
+                    
+        #pick the point with the greatest amount of unknown space around it
+        print possible_points
+        print "Picking best goal"
+        unknown_space = [0]*10
+        for index in range(10):
+            for up in range(-100,100):
+                for side in range(-100,100):
+                    temp_point = int(possible_points[index] + up + (side * map.map.info.width))
+                    #check if in bounds
+                    if(0 < temp_point < len(map.map.data)):
+                        #if unknown
+                        if(map.map.data[ temp_point ] == -1):
+                            unknown_space[index] += 1
+                        #if an obstacle (means it's already explored and impassable)
+                        elif(map.map.data[ temp_point ] == 100):
+                            unknown_space[index] -= 1
+        #assign the next goal to the point with the largest surrounding unknown space/ distance
+        #This is the greedy bit
+        rob_x, rob_y = current_loc
+        for score in unknown_space:
+            point = possible_points[unknown_space.index(score)]
+
+            #location 
+            x = map.map.info.origin.position.x + int(point%map.map.info.width) * map.map.info.resolution
+            y = map.map.info.origin.position.y + int(point/map.map.info.width) * map.map.info.resolution
+            
+            score = score/(math.hypot(rob_x - x, rob_y - y))
+        
+            
+        point = possible_points[unknown_space.index(max(unknown_space))]
+
+        #location 
+        x = map.map.info.origin.position.x + int(point%map.map.info.width) * map.map.info.resolution
+        y = map.map.info.origin.position.y + int(point/map.map.info.width) * map.map.info.resolution
+        goal.target_pose.pose.position.x = x 
+        goal.target_pose.pose.position.y = y 
+    #rotation
+    quaternion = tf.transformations.quaternion_about_axis(0.0, (0,0,1))
+    goal.target_pose.pose.orientation = Quaternion(*quaternion)
+    #show marker
+    return goal
+
+    
+def rec_explore(goal):
+    #prevent loops
+    global goal_array
+    if(len(goal_array)>5):
+        print "Path invalid"
+        return
+    else:
+        goal2 = new_Goal(goal.target_pose.pose.position.x, goal.target_pose.pose.position.y, 'rec')
+    
+        marker = create_Point(goal2.target_pose.pose.position.x, goal2.target_pose.pose.position.y, 2)
+        goal_array.append(goal2)
+
+        print len(goal_array)
+        
+        goal_publisher.publish(marker)
+        move_robot.send_goal(goal2)
+        move_robot.wait_for_result()
+        
+        if(move_robot.get_state() == GoalStatus.SUCCEEDED):
+            rospy.loginfo("Hooray, the robot reached it's goal")
+            while(len(goal_array) > 0):
+                print len(goal_array)
+                next_goal = goal_array.pop()
+                move_robot.send_goal(next_goal)
+                move_robot.wait_for_result()
+                if(move_robot.get_state() == GoalStatus.SUCCEEDED):
+                    rospy.loginfo("Hooray, the robot reached it's goal")
+                else:
+                    rospy.logerr("The robot could not reach it's goal for some reason")
+                    break
+        else:
+            rospy.logerr("The robot could not reach it's goal for some reason, trying recursive move")
+            rec_explore(goal)
+
+
+def vel_Callback(vel):
+
+    x = vel.linear.x
+
+    global avg_vel
+    avg_vel = (x + avg_vel)/2
+
+
+def explore(range):
+    x = range
+    y = range
+    move_count = 0
+    while not rospy.is_shutdown():
+        move_count += 1
+        global avg_vel
+        avg_vel = 0
+        rospy.Subscriber('cmd_vel', Twist, vel_Callback)
+        print "Current Location: ", current_loc
+        print "Looping"
+        goal = new_Goal(x,y, "rand")
+        marker = create_Point(goal.target_pose.pose.position.x, goal.target_pose.pose.position.y, 1)
+        global goal_array
+        goal_array = [goal]
+        goal_publisher.publish(marker)
+        
+        
+        move_robot.send_goal(goal)
+        move_robot.wait_for_result()
+        
+        
+        
+        if(move_robot.get_state() == GoalStatus.SUCCEEDED):
+            rospy.loginfo("Hooray, the robot reached it's goal")
+            map = get_map()
+            map_width = map.map.info.width
+            map_height = map.map.info.height
+            
+        else:
+            rospy.logerr("The robot could not reach it's goal, trying recursive move")
+            rec_explore(goal)
+        
+        current_map = get_map()
+        map_width = current_map.map.info.width 
+        map_height = current_map.map.info.height
+        msg = GA()
+        msg.moves = move_count
+        msg.avg_vel = avg_vel
+        msg.current_entropy = current_entropy
+        msg.map_width = map_width
+        msg.map_height = map_height
+
+        tracker_publisher.publish(msg)    
+            
+def entropy_Callback(ent):
+
+    entropy = ent.data
+
+    global current_entropy
+    current_entropy = entropy
+            
+def callback(loc):            
+    #gets the base_link from tf
+    if listener.frameExists("/base_footprint") and listener.frameExists("/map"):
+            t = listener.getLatestCommonTime("/base_footprint", "/map")
+            position, quaternion = listener.lookupTransform("/map", "/base_footprint", t)
+            x = position[0]
+            y = position[1]
+            global current_loc
+            current_loc = x,y
+    else:
+        return
+            
+
+if __name__ == '__main__':
+    rospy.init_node('greedy_exploration')
+    random.seed(rospy.get_time())
+    print "Starting Greedy Exploration"
+    move_robot = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+    move_robot.wait_for_server()
+    print "Move_Base Server Up"
+    rospy.wait_for_service('dynamic_map')
+    get_map = rospy.ServiceProxy('dynamic_map', GetMap)
+    print "Map Server up"
+    map = get_map()
+    map_width = map.map.info.width 
+    map_height = map.map.info.height
+    origin = 0,0
+    global current_loc
+    global current_entropy
+    current_entropy = 5.0
+    current_loc  = origin
+    listener = TransformListener()
+    goal_array = []
+    initial_range = 1.0
+    goal_publisher = rospy.Publisher('goal_location', Marker)
+    twist_pub = rospy.Publisher('cmd_vel', Twist)
+    rand_turn(twist_pub)
+    tracker_publisher = rospy.Publisher('Move_Tracker', GA)
+    rospy.Subscriber('slam_gmapping/entropy', Float64, entropy_Callback)
+    rospy.Subscriber('robot_pose_ekf/odom', Pose, callback)
+    try:
+        explore(initial_range)
+    except rospy.ROSInterruptException: pass
+    
+    
