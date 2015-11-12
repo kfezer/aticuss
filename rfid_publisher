@@ -1,0 +1,375 @@
+#!/usr/bin/env python
+#rfid_publisher
+#Taken from ROS Tutorials and hrl_rfid
+#RFID msg publisher, pings and publishes constantly
+
+"""
+Copyright (c) 2012, Karl F. Fezer
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met: 
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer. 
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution. 
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The views and conclusions contained in the software and documentation are those
+of the authors and should not be interpreted as representing official policies, 
+either expressed or implied, of the FreeBSD Project.
+
+"""
+
+import roslib; roslib.load_manifest('aticuss')
+import rospy, sound_play, os, sys
+from hrl_rfid import ros_M5e_client as rmc
+from std_msgs.msg import String
+from hrl_rfid.msg import RFIDread
+from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import Marker
+from sound_play.msg import SoundRequest
+from sound_play.libsoundplay import SoundClient
+from geometry_msgs.msg import PoseWithCovarianceStamped as Pose
+from nav_msgs.msg import Odometry
+import binascii
+from tf import TransformListener
+import random
+from deap import base
+from deap import creator
+from deap import tools
+from std_msgs.msg import Float32 as Float
+from aticuss.msg import GA
+import datetime
+import math
+
+
+def rfid_loc(x,y):
+    msg = Odometry() 
+    cov_x = .00001                                      #assume low covariance, lower than odom, .001 when running
+    cov_y = .00001                                      #assume low covariance, lower than odom
+    msg.header.stamp = rospy.Time.now()                  # time of RFID measurement
+    msg.header.frame_id = 'map'                   # the tracked robot frame
+    msg.pose.pose.position.x = x                  # x measurement RFID.
+    msg.pose.pose.position.y = y                  # y measurement RFID.
+    msg.pose.pose.position.z = 0                    # z measurement RFID.
+    msg.pose.pose.orientation.x = 1               # identity quaternion
+    msg.pose.pose.orientation.y = 0               # identity quaternion
+    msg.pose.pose.orientation.z = 0               # identity quaternion
+    msg.pose.pose.orientation.w = 0               # identity quaternion
+    msg.pose.covariance = [cov_x, 0, 0, 0, 0, 0,  # covariance on rfid_x
+                    0, cov_y, 0, 0, 0, 0,   # covariance on rfid_y
+                    0, 0, 1, 0, 0, 0,       # covariance on rfid_z
+                    0, 0, 0, 99999, 0, 0,   # large covariance on rot x
+                    0, 0, 0, 0, 99999, 0,   # large covariance on rot y
+                    0, 0, 0, 0, 0, 99999]   # large covariance on rot z
+    return msg
+
+#initializes the GA pop to 50 tuples of range of error and confidence
+def init_ga():
+    random.seed(rospy.get_time())
+    global population
+    for individual in range(0, 50):
+        #set range for confidence and range 
+        individual = random.uniform(0,200), random.uniform(0,5)
+        population.append(individual)
+
+    return population[0]
+
+#evaluate, if fails, mutate confidence cut-off or range
+def evaluate_pos(actual_x, actualy_y, rfid, rfid_x, rfid_y, rfid_tags, used_or_mapped):
+
+    global current_individual
+    print current_individual
+    conf, range = current_individual
+    
+    
+    #if poorly mapped
+    if(error_checker(rfid)):
+        print 'Mapped Poorly'
+        #mutate EITHER confidence or range
+        conf_or_range = random.random()
+        #if used and shouldnt have, decrease confidence or range
+        if(used_or_mapped == 'used'):
+            if(conf_or_range > .5):
+                range -= random.uniform(0, range)
+            else:
+                conf -= random.uniform(0,range)
+        #if it didn't use and it shouldnt have, increase confidence or range
+        else:
+            if(conf_or_range > .5):
+                range += random.random()
+            else:
+                conf += random.uniform(0, range)
+                
+        current_individual = conf, range
+    #else, mapped well, have individual mate within pop
+    else:
+        print 'Mapped Well'
+        new_ind = random.randint(0,len(population) - 1)
+        population[new_ind] = mean_mate(current_individual, population[new_ind])
+    
+    msg = GA()
+    msg.moves = total_moves
+    msg.errors = rfid_errors
+    msg.rfid_reads = rfid_reads
+    error_publisher.publish(msg)
+
+    current_individual = population[random.randint(0, len(population) -1)]
+    print current_individual
+    return current_individual
+
+#checks surrounding rfid tags for distances, if more than 2 meters off, error is large, needs to remap
+#only works with sequencially numbered tags
+def error_checker(rfid):
+    global rfid_errors
+    error_range = 1.0
+    print 'Checking for Errors'
+    #if more than 2 of the surrounding rfid tags are > range, return true
+    counter = 0
+    x,y = rfid_tags[rfid]
+    for neighbour in range(0,3):
+        if(rfid + neighbour in rfid_tags):
+            print "Neighbor Found"
+            neigh_x, neigh_y = rfid_tags[rfid+neighbour]
+            if((math.fabs(x) - math.fabs(neigh_x)) > error_range or (math.fabs(y) - math.fabs(neigh_y)) > error_range):
+                counter += 1
+        if(rfid - neighbour in rfid_tags):
+            print "Neighbor Found"
+            neigh_x, neigh_y = rfid_tags[rfid-neighbour]
+            if((math.fabs(x) - math.fabs(neigh_x)) > error_range or (math.fabs(y) - math.fabs(neigh_y)) > error_range):
+                counter += 1    
+        if(rfid+(neighbour*1000) in rfid_tags):
+            print "Neighbor Found"
+            neigh_x, neigh_y = rfid_tags[rfid+(neighbour*1000)]
+            if((math.fabs(x) - math.fabs(neigh_x)) > error_range or (math.fabs(y) - math.fabs(neigh_y)) > error_range):
+                counter += 1
+        if(rfid-(neighbour*1000) in rfid_tags):
+            print "Neighbor Found"
+            neigh_x, neigh_y = rfid_tags[rfid-(neighbour*1000)]
+            if((math.fabs(x) - math.fabs(neigh_x)) > error_range or (math.fabs(y) - math.fabs(neigh_y)) > error_range):
+                counter += 1  
+    if counter > 2:
+        print counter,' Errors'
+        rfid_errors = counter
+        return True
+    else:
+        print counter, 'Errors'
+        return False
+
+def mean_mate(parent_1, parent_2):
+    conf_1, range_1 = parent_1
+    conf_2, range_2 = parent_2
+    
+    xover = random.random()
+    if xover > .5:
+        child = conf_1 , range_2
+    else:
+        child = conf_2, range_1 
+    return child
+
+#Everytime a location message is recieved
+def callback(loc):  
+    msg = r.read( antenna = 'AntPort1' )
+    x = 0.0
+    y = 0.0
+    global evolve
+    global current_conf
+    global current_individual
+    global rfid_errors
+    global total_moves
+    global rfid_tags
+    global rfid_reads
+    rfid_errors = 0
+    total_moves += 1
+    conf_cutoff, max_error = current_individual
+    #gets the base_link from tf
+    if tf.frameExists("/base_footprint") and tf.frameExists("/map"):
+            t = tf.getLatestCommonTime("/base_footprint", "/map")
+            position, quaternion = tf.lookupTransform("/map", "/base_footprint", t)
+            x = position[0]
+            y = position[1]
+    #If RFID tag is found
+    if msg[1] != "":
+        rfid_reads += 1
+        #convert the binary hex string read from RFID to an int
+        rfid_rough = binascii.hexlify(msg[1]) #hex code for RFID, converted from bytes
+        rfid = int(rfid_rough[-6:])
+        if rfid in rfid_tags: #it already exists, publish location
+            rfid_x,rfid_y = rfid_tags[rfid]
+            print 'Old Tag # {0:^12} @ x: {1:^12} and y {2:^12}' .format(rfid, rfid_x, rfid_y)
+            
+            global current_conf  
+            #if below cutoff and far out of range of , remap the tag
+            print current_conf, conf_cutoff
+            x_scope = range(int(rfid_x - max_error), int(rfid_x + max_error))
+            
+            y_scope = range(int(rfid_y - max_error), int(rfid_y + max_error))
+            print x_scope, "x", x
+            print y_scope, "y", y
+            
+            
+            if(current_conf > conf_cutoff and (int(x) not in x_scope or int(y) not in y_scope )):
+                 #if evolving, evaluate current subject
+                if(evolve):
+                    new_x, new_y = evaluate_pos(x, y, rfid, rfid_x, rfid_y, rfid_tags, 'remapped')
+                rfid_tags[rfid] = x,y
+                rfid_loc_pub.publish(rfid_loc(x,y))
+                print 'Tag Updated'
+
+            #else, publish location
+            else:
+                #if evolving, evaluate current subject
+                if(evolve):
+                    new_x, new_y = evaluate_pos(x, y, rfid, rfid_x, rfid_y, rfid_tags, 'used')
+                    
+                rfid_loc_pub.publish(rfid_loc(rfid_x,rfid_y))
+                print 'Tag Location Used'
+            
+            #always use location, no updating
+
+            #rfid_loc_pub.publish(rfid_loc(rfid_x,rfid_y))
+            
+        #elif current_conf > conf_cutoff:   #it doesn't exist, add it the the rfid dictionary and markers and conf is high
+        else:
+            rfid_tags[rfid] = x, y
+            print 'New Tag # {0:^12} @ x: {1:^12} and y {2:^12}' .format(rfid, x, y)
+            markerArray.markers.append(create_Point(rfid, x, y))
+            publisher.publish(markerArray)
+            
+        rospy.sleep(.2)
+
+
+#updates the current confidence of the robot, a float    
+def conf_callback(data):
+    global current_conf
+    current_conf = data.data
+    
+    
+    
+#Subscribe to location messages
+def pinger():
+    print 'Pinger Running'
+    r.query_mode()
+    rospy.Subscriber("robot_pose_ekf/odom", Pose, callback)
+    rospy.spin()
+
+
+    
+#creates a new marker every time the robot encounters a RFID tag
+def create_Point(rfid, x, y):
+    marker = Marker()
+    marker.id = int(rfid)
+    marker.header.frame_id = "/map"
+    marker.type = marker.SPHERE
+    marker.action = marker.ADD
+    marker.scale.x = 0.2
+    marker.scale.y = 0.2
+    marker.scale.z = 0.2
+    marker.pose.orientation.w = 1.0
+    #Makes the Point Green
+    marker.color.a = 1.0
+    marker.color.g = 1.0
+    marker.pose.position.x = x
+    marker.pose.position.y = y
+    marker.pose.position.z = 0
+    return marker
+    
+if __name__ == '__main__':
+    rospy.init_node('rfid_mapper', anonymous = True)
+    print 'Starting the RFID Mapper'
+    #os.system("rosrun sound_play say.py 'Starting Mapper'")
+    global rfid_tags
+    global rfid_reads
+    rfid_tags = {}
+    rfid_reads = 0
+
+    current_conf = 100.0
+    global current_indivudual
+    #SET THE EVOLVED CONFIDENCE HERE, 150 AND 5 IS STARTING
+    """
+    previous average:
+    Avg_Conf : 108.553218643
+    Avg_Error Range : 0.159448761764
+    120.277484938  1.91147919898
+    76.4457534665  1.91147919898
+    
+    """
+    #current_individual = 76.4457534665,  1.91147919898
+    #current_individual = 95.5318177273, 2.07716786041
+    current_individual = 96.8953248473,  2.47496197236
+    r = rmc.ROS_M5e_Client( name = 'my_rfid_server')
+    #create Marker Array
+    topic = 'RFID_markers'
+    publisher = rospy.Publisher(topic, MarkerArray)
+    error_publisher = rospy.Publisher('GA_Error_Tracker', GA)
+    markerArray = MarkerArray()
+    tf = TransformListener()
+    rfid_loc_pub = rospy.Publisher('vo', Odometry)
+    global population
+    population = []
+    #global moves
+    global rfid_errors
+    global total_moves
+    total_moves = 0
+    rfid_errors = 0
+    
+    #Turn on evolution or not
+    global evolve
+    #TURN TO FALSE TO TURN OFF EVOLUTION
+    """
+    ############################################### Evolution Boolean
+    """
+    evolve = False
+    if evolve:
+        current_individual = init_ga()
+    print 'Confidence being read'
+    rospy.Subscriber("scan_score", Float, conf_callback)
+    #The Running Loop
+    try:
+       pinger()
+    except rospy.ROSInterruptException: pass
+    print rfid_tags
+    #sound effects
+    #os.system("rosrun sound_play play.py `rospack find pi_speech_tutorial`/sounds/R2D2a.wav")
+    #os.system("rosrun sound_play say.py 'DONE MAPPING'")
+    print "Ignore errors called by RFID server stopping; it stops correctly"
+    print population
+    now = datetime.datetime.now()
+    curpath = os.path.abspath(os.curdir)
+    date = str(now.month) + '_' + str(now.day) + '_' + str(now.hour)
+    f = open(curpath + '/logs/rfid_'+ date + '.txt', 'w+')  
+    print 'Writing to ', date
+    f.write('Run from ' + date + '\n')
+    f.write('Moves taken : ' + str(total_moves) + '\n')
+    f.write('RFID_Reads : ' + str(rfid_reads) + '\n')
+    conf_sum = 0.0
+    range_sum = 0.0
+    for i in population:
+        conf, range = i
+        conf_sum += conf
+        range_sum += range
+        f.write(str(conf) + '  ' + str(range) + '\n')
+        
+    avg_conf = conf_sum/len(population)
+    avg_range = range_sum/len(population)
+    
+    print "Average Confidence : ", avg_conf
+    print "Average range : ", avg_range
+    f.write('Avg_Conf : ' + str(avg_conf) + '\n')
+    f.write('Avg_Error Range : ' + str(avg_range) + '\n')
+    
+    f.close()
+    r.stop()
