@@ -1,0 +1,457 @@
+#!/usr/bin/env python
+#BB Explorer
+#Uses Fuzzy Logic
+#Evolves fuzzy membership functions and behaviours using a GA
+
+"""
+BB Explorer
+"""
+"""
+got help from
+https://github.com/cwru-robotics/cwru-ros-pkg/blob/master/cwru_semi_stable/cwru_goal_planner/src/simple_goal_reader.py
+and 
+http://pi-robot-ros-pkg.googlecode.com/svn/trunk/experimental/pi_robot/pi_navigation/nodes/nav_test.py
+"""
+"""
+This uses the DEAP Python package, which makes up the core of the GA
+
+"""
+"""
+FOR THIS CODE, I USED DEAP, 
+It can be found here:
+http://code.google.com/p/deap/
+
+Information can be found in the following paper:
+
+DEAP: A Python Framework for Evolutionary Algorithms },
+    
+
+"""
+"""
+Copyright (c) 2012, Karl F. Fezer
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met: 
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer. 
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution. 
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The views and conclusions contained in the software and documentation are those
+of the authors and should not be interpreted as representing official policies, 
+either expressed or implied, of the FreeBSD Project.
+
+"""
+
+
+import roslib; roslib.load_manifest('aticuss')
+import rospy, sound_play, os, sys, collections, random, actionlib, tf
+from tf import TransformListener
+from std_msgs.msg import Float64
+from geometry_msgs.msg import PoseStamped
+from move_base_msgs.msg import MoveBaseAction
+from move_base_msgs.msg import MoveBaseGoal
+from actionlib_msgs.msg import GoalStatus
+from geometry_msgs.msg import Quaternion
+from nav_msgs.srv import GetMap
+from geometry_msgs.msg import Twist
+from visualization_msgs.msg import Marker
+from visualization_msgs.msg import MarkerArray
+from geometry_msgs.msg import PoseWithCovarianceStamped as Pose
+import math
+from common_methods import *
+import datetime
+from tf.transformations import euler_from_quaternion
+from std_srvs.srv import Empty
+
+from deap import creator, base, tools, algorithms
+
+import json
+
+from aticuss.msg import GA
+
+
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax, custom_moves = None)
+creator.create("Custom_Moves", list)
+
+toolbox = base.Toolbox()
+
+"""
+THE GENOME:
+
+[Probabilities for Inital Moves] = 4
+[Random|Greedy|10m in front|Area around Robot (Strengthens localization)]
+
+[Voting Weights for 4 different types of areas] = 4
+[Outer Wall (1 line)| Hallway (2 parallel lines) | Corner (other lines of significant length| Open/Muddled/ ]
+#REMOVED
+*Similar to Row-Major Order
+[Probabilities for moves] X 4 for each area type 8  + 1 (9 types)
+[ForwardRand | Forward 2| Rand Turn |Right Turn | Left Turn | Align to Wall| Local Frontier |random move within area | Custom String] 9
+######unused
+
+#seperate part of Individual:
+[Custom move int string] X 4 for each area type
+[List of moves] 5 ints (0-7) 
+"""
+#custom class initializer
+def initExplorer(icls, scls, init_moves, num_area, num_moves, num_steps, num_floats):
+    ind = icls(random.random() for _ in range(num_floats))
+    ind.custom_moves = scls([random.randint(0, num_moves - 1) for _ in range(num_steps)] for _ in range(num_area))
+    return ind
+
+INIT_MOVES = 4
+NUM_AREA = 4
+NUM_MOVES = 9
+CUST_MOVES = 1
+NUM_STEPS = 5
+NUM_FLOATS = INIT_MOVES + NUM_AREA 
+#+ NUM_AREA * (NUM_MOVES + CUST_MOVES)
+#NUM_INTS = NUM_AREA * NUM_MOVES * NUM_STEPS
+#IND_SIZE = NUM_FLOATS + NUM_INTS
+
+
+
+# Attribute generator
+toolbox.register("attr_float", random.random)
+toolbox.register("attr_int", random.randint, 0, NUM_MOVES )
+# Structure initializers
+
+toolbox.register("individual", initExplorer, creator.Individual, creator.Custom_Moves,
+    INIT_MOVES, NUM_AREA, NUM_MOVES, NUM_STEPS, NUM_FLOATS)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+
+
+def move_prob_calc(moves_list, max_move):
+    move_pool = 0.0
+    for i in moves_list:
+        move_pool += i
+    move_prob = random.uniform(0,move_pool)
+    move = max_move - 1
+    j = 0.0
+    for i in range(max_move - 1):
+        j += moves_list[i]
+        if j > move_prob:
+            move = i
+            break
+    return move
+
+ 
+def vel_Callback(vel):
+
+    x = abs(vel.linear.x)
+
+    global avg_vel
+    avg_vel = abs(x + avg_vel)/2
+    
+"""
+Evaluate/Mover::
+
+Get a new individual
+see what kind of move to make
+once area is found, analyze for type
+tally votes to determine area
+if tie: have temp crossover on the 2 tie areas
+move to area
+perform action
+calculate change in entropy, avg velocity, and distance traveled
+
+fitness == (avg velocity + change in entropy) 
+replace fitness
+mutate & crossover
+
+
+select new individual, repeat
+
+"""
+#the movement loop, evaluates each individual by letting it choose a move sequence
+def evalExplorer(individual):
+    global move_count
+    move_count += 1
+    print "Move #: ", move_count
+    start_time = rospy.get_time()
+    global current_entropy
+    starting_entropy = current_entropy
+    print individual
+    print individual.custom_moves
+    #start avg vel calculator
+    global avg_vel
+    avg_vel = 0
+    rospy.Subscriber('cmd_vel', Twist, vel_Callback)
+    
+    current_map = get_map()
+    starting_map_width = current_map.map.info.width 
+    starting_map_height = current_map.map.info.height
+    
+    
+    #initial move
+    rob_x, rob_y = current_loc
+    initial_moves = individual[0:INIT_MOVES - 1]
+    first_move = move_prob_calc(initial_moves, INIT_MOVES)
+    
+    goal = MoveBaseGoal()
+    
+    #Front Goal
+    if first_move == 0:
+        print "10m forward"
+        goal = front_Goal()
+    #Rand Goal
+    elif first_move == 1:
+        print "Random Move"
+        goal = rand_Goal(rob_x, rob_y)
+    #Greedy Goal
+    elif first_move == 2:
+        print "Greedy Move"
+        goal = greedy_Goal(rob_x, rob_y)
+    #Local Area Goal (Do Nothing)
+    else:
+        print "Local Area"
+        goal = local_Goal()
+    
+    marker = create_Point(goal.target_pose.pose.position.x, goal.target_pose.pose.position.y, 1)
+    goal_publisher.publish(marker)
+    move_robot.send_goal(goal)
+    move_robot.wait_for_result()
+    
+    if(move_robot.get_state() == GoalStatus.SUCCEEDED):
+        rospy.loginfo("Hooray, the robot reached it's goal")
+        
+    else:
+        rospy.logerr("The robot could not reach it's goal, trying recursive move")
+        rec_explore(goal_publisher, move_robot, current_loc, goal, [])
+
+            
+    
+    #identify area type
+    rob_x, rob_y = current_loc
+    current_map = get_local_miniMap(rob_x,rob_y)
+
+    votes = randomized_HoughT(current_map)
+    
+    
+    #multiplty Votes by weights
+    vote_weights = individual[INIT_MOVES: INIT_MOVES + NUM_AREA - 1]
+    scores = []
+    for i, j in zip(votes,vote_weights):
+        scores.append(i*j)
+    
+    winner1 = 0, 0
+    winner2 = 0, 0
+
+    
+    for i in range(len(scores)):
+        if(winner1[0] <= scores[i]):
+            winner2 = winner1
+            winner1 = scores[i] , i
+        elif(winner1[0] >= scores[i] >= winner2[0]):
+            winnder2 = scores[i], i
+    #Winner wins!
+    tie = False
+    print "Is the Vote Working?"
+    print winner1
+    print winner2
+    score1, move1 = winner1
+    score2, move2 = winner2
+    #If two votes are close XOVER custom move
+    if(score1 - score2 <= 2):
+        tie = True
+    rob_x, rob_y = current_loc
+    cross = random.randint(0,5)
+    move_set = move1
+    counter = 0
+    #custom move_set for area
+    for i in individual.custom_moves[move_set]:
+        if tie and counter == cross:
+            move_set = move2
+        print i
+        
+        if i == 0:
+            goal = forward_Rand()
+        elif i == 1:
+            goal = forward_2()
+        elif i == 2:
+            rand_turn(twist_pub)
+        elif i == 3:
+            right_turn(twist_pub)
+        elif i == 4:
+            left_turn(twist_pub)
+        elif i == 5:
+            align_to_wall()
+        elif i == 6:
+            goal = local_Frontier(rob_x,rob_y)
+            
+        elif i == 7:
+            goal = local_rand()
+        else:
+            goal = local_Goal()
+        #else, do empty move
+        if goal.target_pose.pose.position.x > 0:
+            goal_publisher.publish(marker)
+            move_robot.send_goal(goal)
+            move_robot.wait_for_result()
+        
+    
+    #get fitness for move
+    #avg velocity + 100* change in entropy
+    end_time = rospy.get_time() - start_time
+    ending_entropy = current_entropy
+    entropy_loss = starting_entropy - ending_entropy
+    final_vel = avg_vel
+    
+    
+    current_map = get_map()
+    ending_map_width = current_map.map.info.width 
+    ending_map_height = current_map.map.info.height
+    
+    map_change = (ending_map_width - starting_map_width) + (ending_map_height - starting_map_height)
+    print "Final Avg_Vel:", final_vel
+    print "Entropy loss: ", entropy_loss
+    print "Change in Map: ", map_change
+    fitness = final_vel * 1000 + (entropy_loss * 1000) + map_change/10
+    
+    
+    current_map = get_map()
+    map_width = current_map.map.info.width 
+    map_height = current_map.map.info.height
+    msg = GA()
+    msg.moves = move_count
+    msg.avg_vel = avg_vel
+    msg.current_entropy = ending_entropy
+    msg.map_width = map_width
+    msg.map_height = map_height
+    msg.fitness = fitness
+
+    tracker_publisher.publish(msg)
+    print "Fitness: ", fitness
+    return fitness 
+
+#Crosses over 1 move from mates
+def movesXOver(individualA, individualB):
+    move = random.randint(0, NUM_AREA - 1)
+    temp_move = individualA.custom_moves[move]
+    individualA.custom_moves[move]  = individualB.custom_moves[move]
+    individualB.custom_moves[move] = temp_move    
+    
+
+# Operator registering
+toolbox.register("evaluate", evalExplorer)
+#normal 2 point crossover
+"""
+2 types of crossover
+2 point crossover of percentages
+Chance to crossover whole move sequence
+"""
+toolbox.register("mate", tools.cxTwoPoints)
+#seperate swap swap move crossover, swaps string of custom moves
+toolbox.register("move_mate", movesXOver)
+
+"""
+Mutation, gaussian, unless ints, then random
+
+"""
+
+
+toolbox.register("mutateFloat", tools.mutGaussian, mu=0, sigma=1, indpb=0.1)
+toolbox.register("mutateInt", tools.mutUniformInt, low = 0, up = NUM_MOVES, indpb = .05)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+#Best Individual from 14 generations of a population of 6 from BB_Evolver
+def impIndividual(icls, scls):
+    ind = icls([0.088214122273091888, 0.94566893173838107, 0.87662834339175355, 0.74001467048082403, 0.57497086623511817, 0.2077178029975677, 0.83682493551525061, 0.6458008944])
+    ind.custom_moves = scls([[8, 8, 7, 6, 2], [7, 7, 4, 7, 6], [7, 1, 0, 7, 7], [2, 8, 8, 1, 7]])
+    return ind
+
+
+
+#toolbox.register("individual_import", impIndividual, creator.Individual, creator.Custom_Moves, x, y)
+
+
+#Main loop of the GA
+def main():
+    random.seed(rospy.get_time())
+    rand_turn(twist_pub)
+    
+    print "Start of run"
+    #contents = json.load(open("pop_dump/best.json", "r"))
+    #custom = json.load(open("pop_dump/best_moves.json", "r"))
+    individual = impIndividual(creator.Individual, creator.Custom_Moves)
+    # Begin the Exploration
+    while not rospy.is_shutdown():
+        
+        evalExplorer(individual)
+        
+   
+ 
+def loc_Callback(loc):            
+    #gets the base_link from tf
+    if listener.frameExists("/base_footprint") and listener.frameExists("/map"):
+            t = listener.getLatestCommonTime("/base_footprint", "/map")
+            position, quaternion = listener.lookupTransform("/map", "/base_footprint", t)
+            x = position[0]
+            y = position[1]
+            global current_loc
+            current_loc = x,y
+    else:
+        return
+    
+    
+
+def entropy_Callback(ent):
+
+    entropy = ent.data
+
+    global current_entropy
+    current_entropy = entropy
+
+
+if __name__ == "__main__":
+    rospy.init_node('BB_Evolver')
+    random.seed(rospy.get_time())
+    print "Behavior Based Evolver"
+    move_robot = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+    move_robot.wait_for_server()
+    print "Move_Base Server Up"
+    rospy.wait_for_service('dynamic_map')
+    get_map = rospy.ServiceProxy('dynamic_map', GetMap)
+    print "Map Server up"
+    current_map = get_map()
+    map_width = current_map.map.info.width 
+    map_height = current_map.map.info.height
+    origin = current_map.map.info.origin.position.x, current_map.map.info.origin.position.y
+    global current_loc
+    current_loc  = origin
+    listener = TransformListener()
+    goal_array = []
+    initial_range = 1.0
+    goal_publisher = rospy.Publisher('goal_location', Marker)
+    twist_pub = rospy.Publisher('cmd_vel', Twist)
+    rospy.Subscriber('robot_pose_ekf/odom', Pose, loc_Callback)
+    global current_entropy
+    current_entropy = 4.0
+    rospy.Subscriber('slam_gmapping/entropy', Float64, entropy_Callback)
+    tracker_publisher = rospy.Publisher('Move_Tracker', GA)
+    ga_publisher = rospy.Publisher('GA_Tracker', GA)
+    global move_count
+    move_count = 0
+    main()
+
+
+
+
+
